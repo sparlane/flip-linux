@@ -31,7 +31,7 @@ Tap::Tap(const char *dev)
     std::cout << "Allocated TAP interface: " << ifr.ifr_name << std::endl;
 
     ioctl(this->fd, SIOCGIFHWADDR, &ifr);
-    memcpy(this->mac, ifr.ifr_hwaddr.sa_data, 6);
+    memcpy(this->mac.data(), ifr.ifr_hwaddr.sa_data, 6);
     std::cout << "TAP MAC Address: " << std::hex << (int)this->mac[0] << ":" << (int)this->mac[1] << ":" << (int)this->mac[2] << ":" << (int)this->mac[3] << ":" << (int)this->mac[4] << ":" << (int)this->mac[5] << std::endl;
 }
 
@@ -43,9 +43,9 @@ Tap::~Tap()
     }
 }
 
-uint8_t* Tap::get_mac() const
+hwaddr_t Tap::get_mac() const
 {
-    return (uint8_t*)this->mac;
+    return this->mac;
 }
 
 bool Tap::send(void *buf, size_t len)
