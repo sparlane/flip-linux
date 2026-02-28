@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cstring>
 #include <csignal>
+#include <unordered_map>
+#include <random>
 #include <poll.h>
 #include <unistd.h>
 #include <sys/timerfd.h>
@@ -16,6 +18,25 @@
 std::unique_ptr<flip_router> router;
 std::shared_ptr<flip_networks> networks;
 std::unique_ptr<UnixServer> unix_server;
+std::unordered_map<int, flip_address_t> unix_client_addresses;
+
+static flip_address_t allocate_unix_client_address()
+{
+    static std::mt19937_64 rng(std::random_device{}());
+    static constexpr flip_address_t kAddressMask = 0x00FFFFFFFFFFFFFFULL;
+
+    for (int attempt = 0; attempt < 1024; ++attempt) {
+        flip_address_t candidate = rng() & kAddressMask;
+        if (candidate == 0) {
+            continue;
+        }
+        if (router->install_local_address(candidate)) {
+            return candidate;
+        }
+    }
+
+    return 0;
+}
 
 static volatile sig_atomic_t should_exit = 0;
 
@@ -99,6 +120,24 @@ int main(int argc, char* argv[])
     unix_server->set_on_message([](int client_fd, uint32_t type, const uint8_t* payload, size_t len) {
         std::cout << "Unix message from fd=" << client_fd << " type=" << type << " len=" << len << std::endl;
         (void)payload;
+    });
+    unix_server->set_on_connect([](int client_fd) {
+        flip_address_t addr = allocate_unix_client_address();
+        if (addr == 0) {
+            std::cerr << "Failed to allocate FLIP address for unix client fd=" << client_fd << std::endl;
+            ::close(client_fd);
+            return;
+        }
+
+        unix_client_addresses[client_fd] = addr;
+        std::cout << "Assigned FLIP address " << addr << " to unix client fd=" << client_fd << std::endl;
+    });
+    unix_server->set_on_disconnect([](int client_fd) {
+        auto it = unix_client_addresses.find(client_fd);
+        if (it != unix_client_addresses.end()) {
+            router->remove_local_address(it->second);
+            unix_client_addresses.erase(it);
+        }
     });
 
     constexpr size_t BUF_SIZE = 2048;

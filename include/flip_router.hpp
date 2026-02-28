@@ -33,7 +33,7 @@ public:
     ~flip_router();
     void route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t len, flip_network_t incoming_network);
     void increment_age();
-    void install_local_address(flip_address_t address);
+    bool install_local_address(flip_address_t address);
     void remove_local_address(flip_address_t address);
     std::shared_ptr<RpcPortManager> get_rpc_port_manager() { return rpc_port_mgr; }
 };

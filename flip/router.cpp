@@ -45,7 +45,8 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
     if (fp->src_address != 0) {
         // Update routing table with source address and incoming network
         auto route = this->find_route(fp->src_address);
-        if (!route || (fp->flags & FLIP_FLAG_UNSAFE && route->hopcount > fp->actual_hopcount)) {
+        // Local routes are authoritative; only add/update non-local entries.
+        if (!route || (!route->local && (fp->flags & FLIP_FLAG_UNSAFE) && route->hopcount > fp->actual_hopcount)) {
             route = std::make_shared<flip_route_entry>();
             route->dst_address = fp->src_address;
             route->network = incoming_network;
@@ -71,7 +72,27 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
         case flip_type::LOCATE:
             if (fp->actual_hopcount == fp->max_hopcount && dst_route && dst_route->local) {
                 std::cout << "Destination " << fp->dst_address << " is local, sending HEREIS response" << std::endl;
-                // Send HEREIS response back to src_mac
+                struct flip_packet hereis_pkt{};
+                hereis_pkt.version = fp->version;
+                hereis_pkt.type = static_cast<uint8_t>(flip_type::HEREIS);
+                hereis_pkt.flags = fp->flags;
+                hereis_pkt.reserved = 0;
+                hereis_pkt.actual_hopcount = 0;
+                hereis_pkt.max_hopcount = fp->max_hopcount;
+                hereis_pkt.dst_address = fp->src_address;
+                hereis_pkt.src_address = fp->dst_address;
+                hereis_pkt.message_id = fp->message_id;
+                hereis_pkt.length = 0;
+                hereis_pkt.offset = 0;
+                hereis_pkt.total_length = 0;
+
+                const auto& nets = networks->get_networks();
+                auto it = nets.find(incoming_network);
+                if (it != nets.end()) {
+                    if (!it->second->send(src_mac, flip_ethertype_network(), &hereis_pkt, sizeof(hereis_pkt))) {
+                        std::cerr << "Failed sending HEREIS response on network " << incoming_network << std::endl;
+                    }
+                }
             } else if (!dst_route || !dst_route->local) {
                 // Forward LOCATE packet to all other networks if destination not found or not local
                 if (fp->actual_hopcount < fp->max_hopcount) {
@@ -148,6 +169,42 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
         default:
             std::cerr << "Received packet with unknown FLIP type: " << (int)fp->type << std::endl;
             break;
+    }
+}
+
+bool flip_router::install_local_address(flip_address_t address)
+{
+    if (address == 0) {
+        return false;
+    }
+
+    auto existing = find_route(address);
+    if (existing) {
+        return existing->local;
+    }
+
+    auto route = std::make_shared<flip_route_entry>();
+    route->dst_address = address;
+    route->network = 0;
+    route->next_hop_mac = hwaddr_t{0, 0, 0, 0, 0, 0};
+    route->hopcount = 0;
+    route->trusted = true;
+    route->age = 0;
+    route->local = true;
+    routing_table[address] = route;
+    return true;
+}
+
+void flip_router::remove_local_address(flip_address_t address)
+{
+    auto it = routing_table.find(address);
+    if (it == routing_table.end()) {
+        return;
+    }
+
+    if (it->second->local) {
+        routing_table.erase(it);
+        std::cout << "Removed local FLIP address " << address << std::endl;
     }
 }
 
