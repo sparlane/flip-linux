@@ -3,6 +3,7 @@
 #include <vector>
 #include <chrono>
 #include <cstring>
+#include <csignal>
 #include <poll.h>
 #include <unistd.h>
 #include <sys/timerfd.h>
@@ -15,6 +16,13 @@
 std::unique_ptr<flip_router> router;
 std::unique_ptr<flip_networks> networks;
 std::unique_ptr<UnixServer> unix_server;
+
+static volatile sig_atomic_t should_exit = 0;
+
+static void handle_sigint(int)
+{
+    should_exit = 1;
+}
 
 void recv_packet(const uint8_t* packet, size_t len, flip_network_t incoming_network)
 {
@@ -43,6 +51,8 @@ void recv_packet(const uint8_t* packet, size_t len, flip_network_t incoming_netw
 
 int main(int argc, char* argv[])
 {
+    std::signal(SIGINT, handle_sigint);
+
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " tapX [tapY ...]" << std::endl;
         return 1;
@@ -94,7 +104,7 @@ int main(int argc, char* argv[])
     constexpr size_t BUF_SIZE = 2048;
     uint8_t buf[BUF_SIZE];
 
-    while (true) {
+    while (!should_exit) {
         // Rebuild poll set each iteration to account for new/removed unix clients
         pfds.resize(tap_devs.size() + 1); // tap fds + timer fd
 
@@ -116,6 +126,12 @@ int main(int argc, char* argv[])
 
         int ret = poll(pfds.data(), pfds.size(), -1);
         if (ret < 0) {
+            if (errno == EINTR) {
+                if (should_exit) {
+                    break;
+                }
+                continue;
+            }
             std::cerr << "poll error: " << strerror(errno) << std::endl;
             break;
         }
