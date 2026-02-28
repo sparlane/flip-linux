@@ -14,7 +14,7 @@
 #include "unix_server.hpp"
 
 std::unique_ptr<flip_router> router;
-std::unique_ptr<flip_networks> networks;
+std::shared_ptr<flip_networks> networks;
 std::unique_ptr<UnixServer> unix_server;
 
 static volatile sig_atomic_t should_exit = 0;
@@ -58,7 +58,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    networks = std::make_unique<flip_networks>();
+    networks = std::make_shared<flip_networks>();
     std::vector<std::shared_ptr<Tap>> tap_devs;
     std::vector<struct pollfd> pfds;
 
@@ -88,7 +88,7 @@ int main(int argc, char* argv[])
     timer_pfd.events = POLLIN;
     pfds.push_back(timer_pfd);
 
-    router = std::make_unique<flip_router>();
+    router = std::make_unique<flip_router>(networks);
 
     // Start Unix socket server
     unix_server = std::make_unique<UnixServer>("/tmp/flip.sock");

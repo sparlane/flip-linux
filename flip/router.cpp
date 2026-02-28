@@ -2,9 +2,10 @@
 #include <cstring>
 #include "flip_router.hpp"
 
-flip_router::flip_router()
+flip_router::flip_router(std::shared_ptr<flip_networks> net)
 {
     rpc_port_mgr = std::make_shared<RpcPortManager>();
+    networks = net;
 }
 
 flip_router::~flip_router()
@@ -19,6 +20,18 @@ std::shared_ptr<flip_route_entry> flip_router::find_route(flip_address_t dst)
         return it->second;
     }
     return nullptr;
+}
+
+static std::string packet_type_to_string(flip_type type) {
+    switch (type) {
+        case flip_type::LOCATE: return "LOCATE";
+        case flip_type::HEREIS: return "HEREIS";
+        case flip_type::UNIDATA: return "UNIDATA";
+        case flip_type::MULTIDATA: return "MULTIDATA";
+        case flip_type::NOTHERE: return "NOTHERE";
+        case flip_type::UNTRUSTED: return "UNTRUSTED";
+        default: return "UNKNOWN";
+    }
 }
 
 void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t len, flip_network_t incoming_network)
@@ -59,13 +72,19 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
             if (fp->actual_hopcount == fp->max_hopcount && dst_route && dst_route->local) {
                 std::cout << "Destination " << fp->dst_address << " is local, sending HEREIS response" << std::endl;
                 // Send HEREIS response back to src_mac
-            } else {
-                // Forward LOCATE packet to next hop(s) based on routing table
+            } else if (!dst_route || !dst_route->local) {
+                // Forward LOCATE packet to all other networks if destination not found or not local
+                if (fp->actual_hopcount < fp->max_hopcount) {
+                    forward_broadcast(packet, len, incoming_network);
+                }
             }
             break;
         case flip_type::HEREIS:
             // Route already added by the source based route adding.
-            // May need to forward this packet
+            // May need to forward this packet to nodes that requested this address
+            if (dst_route && !dst_route->local && dst_route->network != incoming_network) {
+                forward_unicast(packet, len, dst_route->next_hop_mac, dst_route->network);
+            }
             break;
         case flip_type::MULTIDATA:
             // MULTIDATA packets have a 4-byte proto field followed by protocol-specific data
@@ -82,6 +101,10 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
                     }
                 }
             }
+            // Forward MULTIDATA as broadcast to all networks except incoming
+            if (fp->actual_hopcount < fp->max_hopcount) {
+                forward_broadcast(packet, len, incoming_network);
+            }
             break;
         case flip_type::UNIDATA:
             // Check if this is an RPC HEREIS message
@@ -91,25 +114,41 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
                     handle_rpc_hereis(fp->src_address, rpc_hdr);
                 }
             }
-            // Need to queue/send this packet to the local application if dst is local, or forward to next hop if not
+
+            // Route UNIDATA based on destination
+            if (dst_route && dst_route->local) {
+                // Destination is local, deliver to application (don't forward)
+                std::cout << "UNIDATA for local destination " << fp->dst_address << std::endl;
+            } else if (dst_route && fp->actual_hopcount < fp->max_hopcount) {
+                // Destination is known, forward to specific network
+                forward_unicast(packet, len, dst_route->next_hop_mac, dst_route->network);
+            } else if (!dst_route) {
+                // Destination unknown - may need to generate implicit LOCATE
+                std::cout << "UNIDATA for unknown destination " << fp->dst_address << " (no route)" << std::endl;
+            }
             break;
         case flip_type::NOTHERE:
-            if (dst_route && dst_route->network == incoming_network) {
-                std::cout << "Received NOTHERE for destination " << fp->dst_address << " on network " << incoming_network << ", removing route" << std::endl;
-                routing_table.erase(fp->dst_address);
-            }
-            // May need to forward NOTHERE to the source of the original packet if this is a response to a LOCATE
-            break;
         case flip_type::UNTRUSTED:
-            // Handle UNTRUSTED packet
-            // May need to forward UNTRUSTED to the source of the original packet if this is a response to a LOCATE
+            {
+                if (dst_route && dst_route->network == incoming_network &&  fp->type == (uint8_t)flip_type::NOTHERE) {
+                    std::cout << "Received NOTHERE for destination " << fp->dst_address << " on network " << incoming_network << ", removing route" << std::endl;
+                    routing_table.erase(fp->dst_address);
+                }
+                auto src_route = this->find_route(fp->src_address);
+                if (src_route) {
+                    if (src_route->network == incoming_network) {
+                        // Skip forwarding NOTHERE/UNTRUSTED back to source of original packet if it came from this network
+                    }
+                    else {
+                        forward_unicast(packet, len, src_route->next_hop_mac, src_route->network);
+                    }
+                }
+            }
             break;
         default:
             std::cerr << "Received packet with unknown FLIP type: " << (int)fp->type << std::endl;
             break;
     }
-    // Process the incoming packet, determine routing, and forward as needed
-    // This is where the main routing logic will be implemented
 }
 
 void flip_router::increment_age()
@@ -185,4 +224,59 @@ void flip_router::handle_rpc_hereis(flip_address_t src_addr, const rpc_header* r
     rpc_port_t port_array;
     std::copy(rpc_hdr->port, rpc_hdr->port + 6, port_array.begin());
     rpc_port_mgr->resolve_remote_lookup(port_array, std::to_string(src_addr), true);
+}
+
+void flip_router::forward_broadcast(const uint8_t* packet, size_t len, flip_network_t incoming_network)
+{
+    if (!networks) {
+        return;
+    }
+
+    uint8_t forward_buf[2048];
+    if (len > sizeof(forward_buf)) {
+        std::cerr << "Packet too large to forward" << std::endl;
+        return;
+    }
+
+    std::memcpy(forward_buf, packet, len);
+    struct flip_packet* forward_pkt = (struct flip_packet*)forward_buf;
+    forward_pkt->actual_hopcount++;
+
+    const auto& nets = networks->get_networks();
+    for (const auto& [net_id, driver] : nets) {
+        if (net_id != incoming_network) {
+            if (!driver->send(std::array<uint8_t, 6>{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, flip_ethertype_network(), forward_buf, len)) {
+                std::cerr << "Failed to forward " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << net_id << std::endl;
+            } else {
+                std::cout << "Forwarded " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << net_id << std::endl;
+            }
+        }
+    }
+}
+
+void flip_router::forward_unicast(const uint8_t* packet, size_t len, const hwaddr_t dst_mac, flip_network_t dst_network)
+{
+    if (!networks) {
+        return;
+    }
+
+    uint8_t forward_buf[2048];
+    if (len > sizeof(forward_buf)) {
+        std::cerr << "Packet too large to forward" << std::endl;
+        return;
+    }
+
+    std::memcpy(forward_buf, packet, len);
+    struct flip_packet* forward_pkt = (struct flip_packet*)forward_buf;
+    forward_pkt->actual_hopcount++;
+
+    const auto& nets = networks->get_networks();
+    auto it = nets.find(dst_network);
+    if (it != nets.end()) {
+        if (!it->second->send(dst_mac, flip_ethertype_network(), forward_buf, len)) {
+            std::cerr << "Failed to forward " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << dst_network << std::endl;
+        } else {
+            std::cout << "Forwarded " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << dst_network << std::endl;
+        }
+    }
 }
