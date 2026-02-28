@@ -1,9 +1,10 @@
 #include <iostream>
+#include <cstring>
 #include "flip_router.hpp"
 
 flip_router::flip_router()
 {
-    // Initialize routing table, etc.
+    rpc_port_mgr = std::make_shared<RpcPortManager>();
 }
 
 flip_router::~flip_router()
@@ -50,7 +51,7 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
         dst_route = this->find_route(fp->dst_address);
     }
 
-    std::cout << "Received " << fp->type << " packet from " << (int)src_mac[0] << ":" << (int)src_mac[1] << ":" << (int)src_mac[2] << ":" << (int)src_mac[3] << ":" << (int)src_mac[4] << ":" << (int)src_mac[5] << std::endl;
+    std::cout << "Received " << (int)fp->type << " packet from " << (int)src_mac[0] << ":" << (int)src_mac[1] << ":" << (int)src_mac[2] << ":" << (int)src_mac[3] << ":" << (int)src_mac[4] << ":" << (int)src_mac[5] << std::endl;
 
     switch ((flip_type)fp->type)
     {
@@ -66,10 +67,31 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
             // Route already added by the source based route adding.
             // May need to forward this packet
             break;
-        case flip_type::UNIDATA:
-            // Need to queue/send this packet to the local application if dst is local, or forward to next hop if not
-            break;
         case flip_type::MULTIDATA:
+            // MULTIDATA packets have a 4-byte proto field followed by protocol-specific data
+            if (len >= sizeof(flip_packet) + sizeof(uint32_t) + sizeof(rpc_header)) {
+                uint32_t proto;
+                std::memcpy(&proto, packet + sizeof(struct flip_packet), sizeof(uint32_t));
+                proto = ntohl(proto);
+                if (proto == PROTO_RPC) {
+                    const rpc_header* rpc_hdr = (const rpc_header*)(packet + sizeof(struct flip_packet) + sizeof(uint32_t));
+                    if (rpc_hdr->type == AM_RPC_LOCATE && fp->dst_address == 0) {
+                        const uint8_t* payload = packet + sizeof(struct flip_packet) + sizeof(uint32_t) + sizeof(rpc_header);
+                        size_t payload_len = len - sizeof(struct flip_packet) - sizeof(uint32_t) - sizeof(rpc_header);
+                        handle_rpc_locate(fp->src_address, fp->dst_address, rpc_hdr, fp->actual_hopcount, payload, payload_len, incoming_network);
+                    }
+                }
+            }
+            break;
+        case flip_type::UNIDATA:
+            // Check if this is an RPC HEREIS message
+            if (len >= sizeof(struct flip_packet) + sizeof(rpc_header) && fp->offset == 0) {
+                const rpc_header* rpc_hdr = (const rpc_header*)(packet + sizeof(struct flip_packet));
+                if (rpc_hdr->type == AM_RPC_HEREIS) {
+                    handle_rpc_hereis(fp->src_address, rpc_hdr);
+                }
+            }
+            // Need to queue/send this packet to the local application if dst is local, or forward to next hop if not
             break;
         case flip_type::NOTHERE:
             if (dst_route && dst_route->network == incoming_network) {
@@ -94,4 +116,73 @@ void flip_router::increment_age()
 {
     // Increment the age of routing entries, remove stale entries, etc.
     // This will be called periodically to maintain the routing table
+}
+
+void flip_router::handle_rpc_locate(flip_address_t src_addr, flip_address_t dst_addr, const rpc_header* rpc_hdr, uint16_t actual_hopcount, const uint8_t* payload, size_t payload_len, flip_network_t incoming_network)
+{
+    (void)payload;
+    (void)payload_len;
+    (void)incoming_network;
+
+    // Check if we have this port registered locally
+    rpc_port_t port_array;
+    std::copy(rpc_hdr->port, rpc_hdr->port + 6, port_array.begin());
+    auto binding = rpc_port_mgr->get_local_binding(port_array);
+    if (!binding.has_value()) {
+        std::cout << "RPC LOCATE for port " << (int)rpc_hdr->port[0] << " not found locally" << std::endl;
+        return;
+    }
+
+    std::cout << "RPC LOCATE for port " << (int)rpc_hdr->port[0] << " found locally, sending HEREIS" << std::endl;
+
+    // Build and send HEREIS response
+    struct flip_packet hereis_pkt;
+    hereis_pkt.version = 1;
+    hereis_pkt.type = (uint8_t)flip_type::UNIDATA;
+    hereis_pkt.flags = 0;
+    hereis_pkt.reserved = 0;
+    hereis_pkt.actual_hopcount = 0;
+    hereis_pkt.max_hopcount = actual_hopcount;
+    hereis_pkt.dst_address = src_addr;
+    hereis_pkt.src_address = dst_addr;
+    hereis_pkt.message_id = rpc_hdr->tid;
+    hereis_pkt.offset = 0;
+
+    // Create RPC HEREIS response header
+    rpc_header hereis_rpc;
+    hereis_rpc.kid = rpc_hdr->kid;
+    std::copy(rpc_hdr->port, rpc_hdr->port + 6, hereis_rpc.port);
+    hereis_rpc.type = AM_RPC_HEREIS;
+    hereis_rpc.flags = 0;
+    hereis_rpc.tid = rpc_hdr->tid;
+    hereis_rpc.dest = rpc_hdr->from;
+    hereis_rpc.from = rpc_hdr->dest;
+
+    // Socket name payload
+    const std::string& socket_name = binding->unix_socket;
+    size_t rpc_payload_len = sizeof(hereis_rpc) + socket_name.size();
+    hereis_pkt.length = rpc_payload_len;
+    hereis_pkt.total_length = rpc_payload_len;
+
+    uint8_t hereis_buf[512];
+    if (sizeof(hereis_pkt) + sizeof(hereis_rpc) + socket_name.size() > sizeof(hereis_buf)) {
+        std::cerr << "RPC HEREIS response too large" << std::endl;
+        return;
+    }
+
+    std::memcpy(hereis_buf, &hereis_pkt, sizeof(hereis_pkt));
+    std::memcpy(hereis_buf + sizeof(hereis_pkt), &hereis_rpc, sizeof(hereis_rpc));
+    std::memcpy(hereis_buf + sizeof(hereis_pkt) + sizeof(hereis_rpc), socket_name.c_str(), socket_name.size());
+
+    // TODO: Send HEREIS packet through network driver
+    std::cout << "HEREIS response prepared (socket: " << socket_name << ")" << std::endl;
+}
+
+void flip_router::handle_rpc_hereis(flip_address_t src_addr, const rpc_header* rpc_hdr)
+{
+    std::cout << "Received RPC HEREIS for port " << (int)rpc_hdr->port[0] << " from " << src_addr << std::endl;
+    // Resolve pending lookup with the source address as the remote socket identifier
+    rpc_port_t port_array;
+    std::copy(rpc_hdr->port, rpc_hdr->port + 6, port_array.begin());
+    rpc_port_mgr->resolve_remote_lookup(port_array, std::to_string(src_addr), true);
 }
