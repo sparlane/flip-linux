@@ -1,5 +1,5 @@
 CXXFLAGS= -Wall -Wextra -Werror -std=c++23 -ggdb2 -I./include
-CXX_SOURCES=flip_linux.cpp $(addprefix driver/, tap.cpp) $(addprefix flip/, protocol.cpp router.cpp)
+CXX_SOURCES=flip_linux.cpp $(addprefix driver/, tap.cpp) $(addprefix flip/, protocol.cpp router.cpp) $(addprefix unix/, unix_server.cpp)
 OBJS= $(CXX_SOURCES:.cpp=.o)
 all: flip_linux
 
