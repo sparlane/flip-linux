@@ -23,6 +23,7 @@ private:
     std::map<flip_address_t, std::shared_ptr<flip_route_entry>> routing_table;
     std::shared_ptr<RpcPortManager> rpc_port_mgr;
     std::shared_ptr<flip_networks> networks;
+    uint32_t locate_tid{0};
     std::shared_ptr<flip_route_entry> find_route(flip_address_t dst);
     void handle_rpc_locate(flip_address_t src_addr, flip_address_t dst_addr, const rpc_header* rpc_hdr, uint16_t actual_hopcount, const uint8_t* payload, size_t payload_len, flip_network_t incoming_network);
     void handle_rpc_hereis(flip_address_t src_addr, const rpc_header* rpc_hdr);
@@ -35,5 +36,6 @@ public:
     void increment_age();
     bool install_local_address(flip_address_t address);
     void remove_local_address(flip_address_t address);
+    void send_rpc_locate(flip_address_t src_addr, const rpc_port_t& port);
     std::shared_ptr<RpcPortManager> get_rpc_port_manager() { return rpc_port_mgr; }
 };

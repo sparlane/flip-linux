@@ -5,11 +5,37 @@
 #include <vector>
 #include <functional>
 #include <sys/un.h>
+#include "flip_proto.hpp"
 
 // Message header sent over the Unix socket
 struct unix_message_header {
+    uint32_t type;        // Application-defined message type
     uint32_t length;     // Length of the payload following this header
-    uint32_t type;       // Application-defined message type
+} __attribute__((packed));
+
+// Unix message types
+enum unix_msg_type : uint32_t {
+    UNIX_MSG_TRANS = 3,  // Transmit a FLIP UNIDATA packet
+};
+
+struct port {
+    uint8_t port_id[6];
+};
+
+struct am_private {
+    int8_t prv_object[3];
+    int8_t prv_rights;
+    port prv_random;
+};
+
+struct am_header {
+    uint8_t port[6];
+    uint8_t signature[6];
+    struct am_private priv;
+    uint16_t cmd;
+    int32_t offset;
+    uint16_t bufsize;
+    uint16_t extra;
 } __attribute__((packed));
 
 // Per-client state

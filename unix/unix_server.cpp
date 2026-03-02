@@ -156,7 +156,7 @@ bool UnixServer::send_to_client(int client_fd, uint32_t type, const uint8_t* pay
 {
     unix_message_header hdr{};
     hdr.length = static_cast<uint32_t>(len);
-    hdr.type = type;
+    hdr.type = static_cast<uint8_t>(type);
 
     // Use writev to send header + payload atomically
     struct iovec iov[2];

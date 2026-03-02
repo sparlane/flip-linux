@@ -85,6 +85,12 @@ void RpcPortManager::resolve_remote_lookup(const rpc_port_t& port, const std::st
     }
 }
 
+bool RpcPortManager::has_pending_lookup(const rpc_port_t& port) const
+{
+    auto it = pending_lookups.find(port);
+    return it != pending_lookups.end() && !it->second.empty();
+}
+
 size_t RpcPortManager::pending_lookup_count() const
 {
     size_t total = 0;
