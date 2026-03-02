@@ -118,8 +118,74 @@ int main(int argc, char* argv[])
         return 1;
     }
     unix_server->set_on_message([](int client_fd, uint32_t type, const uint8_t* payload, size_t len) {
-        std::cout << "Unix message from fd=" << client_fd << " type=" << type << " len=" << len << std::endl;
-        (void)payload;
+        if (type == UNIX_MSG_TRANS) {
+            if (len < sizeof(am_header)) {
+                std::cerr << "Unix trans message too short from fd=" << client_fd << std::endl;
+                return;
+            }
+            auto addr_it = unix_client_addresses.find(client_fd);
+            if (addr_it == unix_client_addresses.end()) {
+                std::cerr << "No FLIP address for unix client fd=" << client_fd << std::endl;
+                return;
+            }
+
+            am_header hdr;
+            std::memcpy(&hdr, payload, sizeof(hdr));
+            flip_address_t src_addr = addr_it->second;
+
+            rpc_port_t port_array;
+            std::copy(hdr.port, hdr.port + 6, port_array.begin());
+
+            // Capture am_header + data for later use (shared to allow copy into std::function)
+            auto trans_data = std::make_shared<std::vector<uint8_t>>(payload, payload + len);
+
+            static uint32_t trans_tid{0};
+            auto send_unidata = [src_addr, trans_data](flip_address_t dst_addr) {
+                struct flip_packet fp{};
+                fp.version = 1;
+                fp.type = static_cast<uint8_t>(flip_type::UNIDATA);
+                fp.actual_hopcount = 0;
+                fp.max_hopcount = 8;
+                fp.dst_address = dst_addr;
+                fp.src_address = src_addr;
+                fp.message_id = ++trans_tid;
+                fp.length = static_cast<uint32_t>(trans_data->size());
+                fp.offset = 0;
+                fp.total_length = fp.length;
+
+                std::vector<uint8_t> pkt_buf(sizeof(flip_packet) + trans_data->size());
+                std::memcpy(pkt_buf.data(), &fp, sizeof(flip_packet));
+                std::memcpy(pkt_buf.data() + sizeof(flip_packet), trans_data->data(), trans_data->size());
+
+                static const hwaddr_t local_mac{};
+                router->route_packet(local_mac, pkt_buf.data(), pkt_buf.size(), 0);
+            };
+
+            // Check if destination port is local
+            auto rpc_mgr = router->get_rpc_port_manager();
+            auto local_binding = rpc_mgr->get_local_binding(port_array);
+            if (local_binding.has_value()) {
+                auto dst_it = unix_client_addresses.find(local_binding->client_fd);
+                if (dst_it != unix_client_addresses.end()) {
+                    send_unidata(dst_it->second);
+                    return;
+                }
+            }
+
+            // Remote: only send LOCATE if no outstanding lookup for this port is already in flight
+            bool need_locate = !rpc_mgr->has_pending_lookup(port_array);
+            rpc_mgr->begin_remote_lookup(port_array, client_fd,
+                [send_unidata](int, const rpc_port_t&, const std::string& remote_socket, bool found) {
+                    if (!found) return;
+                    send_unidata(std::stoull(remote_socket));
+                });
+            if (need_locate) {
+                router->send_rpc_locate(src_addr, port_array);
+            }
+        } else {
+            std::cout << "Unix message from fd=" << client_fd << " type=" << type << " len=" << len << std::endl;
+            (void)payload;
+        }
     });
     unix_server->set_on_connect([](int client_fd) {
         flip_address_t addr = allocate_unix_client_address();

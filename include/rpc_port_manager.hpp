@@ -35,6 +35,7 @@ public:
 
     void begin_remote_lookup(const rpc_port_t& port, int client_fd, lookup_cb cb);
     void resolve_remote_lookup(const rpc_port_t& port, const std::string& remote_socket, bool found);
+    bool has_pending_lookup(const rpc_port_t& port) const;
 
     size_t local_port_count() const { return local_ports.size(); }
     size_t pending_lookup_count() const;

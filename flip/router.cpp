@@ -214,6 +214,40 @@ void flip_router::increment_age()
     // This will be called periodically to maintain the routing table
 }
 
+void flip_router::send_rpc_locate(flip_address_t src_addr, const rpc_port_t& port)
+{
+    struct flip_packet fp{};
+    fp.version = 1;
+    fp.type = static_cast<uint8_t>(flip_type::MULTIDATA);
+    fp.flags = 0;
+    fp.actual_hopcount = 0;
+    fp.max_hopcount = 8;
+    fp.dst_address = 0;
+    fp.src_address = src_addr;
+    fp.message_id = ++locate_tid;
+    fp.length = sizeof(uint32_t) + sizeof(rpc_header);
+    fp.offset = 0;
+    fp.total_length = fp.length;
+
+    uint32_t proto = htonl(PROTO_RPC);
+
+    rpc_header rpc_hdr{};
+    std::copy(port.begin(), port.end(), rpc_hdr.port);
+    rpc_hdr.type = AM_RPC_LOCATE;
+    rpc_hdr.flags = 0;
+    rpc_hdr.tid = fp.message_id;
+    rpc_hdr.dest = 0;
+    rpc_hdr.from = 0;
+
+    uint8_t buf[sizeof(flip_packet) + sizeof(uint32_t) + sizeof(rpc_header)];
+    std::memcpy(buf,                              &fp,      sizeof(fp));
+    std::memcpy(buf + sizeof(fp),                 &proto,   sizeof(proto));
+    std::memcpy(buf + sizeof(fp) + sizeof(proto), &rpc_hdr, sizeof(rpc_hdr));
+
+    // incoming_network = 0: no real network has this id, so all networks receive the LOCATE
+    forward_broadcast(buf, sizeof(buf), 0);
+}
+
 void flip_router::handle_rpc_locate(flip_address_t src_addr, flip_address_t dst_addr, const rpc_header* rpc_hdr, uint16_t actual_hopcount, const uint8_t* payload, size_t payload_len, flip_network_t incoming_network)
 {
     (void)payload;
@@ -290,19 +324,22 @@ void flip_router::forward_broadcast(const uint8_t* packet, size_t len, flip_netw
     }
 
     uint8_t forward_buf[2048];
-    if (len > sizeof(forward_buf)) {
+    if (sizeof(fc_header) + len > sizeof(forward_buf)) {
         std::cerr << "Packet too large to forward" << std::endl;
         return;
     }
 
-    std::memcpy(forward_buf, packet, len);
-    struct flip_packet* forward_pkt = (struct flip_packet*)forward_buf;
-    forward_pkt->actual_hopcount++;
+    struct fc_header fch{};
+    std::memcpy(forward_buf, &fch, sizeof(fch));
+    std::memcpy(forward_buf + sizeof(fch), packet, len);
+    struct flip_packet* forward_pkt = (struct flip_packet*)(forward_buf + sizeof(fch));
+    forward_pkt->actual_hopcount+=3;
+    size_t forward_len = sizeof(fch) + len;
 
     const auto& nets = networks->get_networks();
     for (const auto& [net_id, driver] : nets) {
         if (net_id != incoming_network) {
-            if (!driver->send(std::array<uint8_t, 6>{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, flip_ethertype_network(), forward_buf, len)) {
+            if (!driver->send(std::array<uint8_t, 6>{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, FLIP_ETHERTYPE, forward_buf, forward_len)) {
                 std::cerr << "Failed to forward " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << net_id << std::endl;
             } else {
                 std::cout << "Forwarded " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << net_id << std::endl;
@@ -318,19 +355,22 @@ void flip_router::forward_unicast(const uint8_t* packet, size_t len, const hwadd
     }
 
     uint8_t forward_buf[2048];
-    if (len > sizeof(forward_buf)) {
+    if (sizeof(fc_header) + len > sizeof(forward_buf)) {
         std::cerr << "Packet too large to forward" << std::endl;
         return;
     }
 
-    std::memcpy(forward_buf, packet, len);
-    struct flip_packet* forward_pkt = (struct flip_packet*)forward_buf;
-    forward_pkt->actual_hopcount++;
+    struct fc_header fch{};
+    std::memcpy(forward_buf, &fch, sizeof(fch));
+    std::memcpy(forward_buf + sizeof(fch), packet, len);
+    struct flip_packet* forward_pkt = (struct flip_packet*)(forward_buf + sizeof(fch));
+    forward_pkt->actual_hopcount+=3;
+    size_t forward_len = sizeof(fch) + len;
 
     const auto& nets = networks->get_networks();
     auto it = nets.find(dst_network);
     if (it != nets.end()) {
-        if (!it->second->send(dst_mac, flip_ethertype_network(), forward_buf, len)) {
+        if (!it->second->send(dst_mac, FLIP_ETHERTYPE, forward_buf, forward_len)) {
             std::cerr << "Failed to forward " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << dst_network << std::endl;
         } else {
             std::cout << "Forwarded " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << dst_network << std::endl;
