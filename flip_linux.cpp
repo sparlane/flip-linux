@@ -129,18 +129,18 @@ int main(int argc, char* argv[])
                 return;
             }
 
-            am_header hdr;
-            std::memcpy(&hdr, payload, sizeof(hdr));
+            auto hdr = std::make_shared<am_header>();
+            std::memcpy(hdr.get(), payload, sizeof(am_header));
             flip_address_t src_addr = addr_it->second;
 
             rpc_port_t port_array;
-            std::copy(hdr.port, hdr.port + 6, port_array.begin());
+            std::copy(hdr->port, hdr->port + 6, port_array.begin());
 
             // Capture am_header + data for later use (shared to allow copy into std::function)
-            auto trans_data = std::make_shared<std::vector<uint8_t>>(payload, payload + len);
+            auto trans_data = std::make_shared<std::vector<uint8_t>>(payload + sizeof(am_header), payload + len);
 
             static uint32_t trans_tid{0};
-            auto send_unidata = [src_addr, trans_data](flip_address_t dst_addr) {
+            auto send_unidata = [src_addr, hdr, trans_data](flip_address_t dst_addr) {
                 struct flip_packet fp{};
                 fp.version = 1;
                 fp.type = static_cast<uint8_t>(flip_type::UNIDATA);
@@ -149,13 +149,24 @@ int main(int argc, char* argv[])
                 fp.dst_address = dst_addr;
                 fp.src_address = src_addr;
                 fp.message_id = ++trans_tid;
-                fp.length = static_cast<uint32_t>(trans_data->size());
+                fp.length = static_cast<uint32_t>(sizeof(rpc_header) + sizeof(am_header) + hdr->bufsize);
                 fp.offset = 0;
                 fp.total_length = fp.length;
 
-                std::vector<uint8_t> pkt_buf(sizeof(flip_packet) + trans_data->size());
+                struct rpc_header rpc_hdr{};
+                rpc_hdr.kid = 0; // Not used for UNIDATA
+                std::copy(hdr->port, hdr->port + 6, rpc_hdr.port);
+                rpc_hdr.type = AM_RPC_REQUEST;
+                rpc_hdr.flags = 0;
+                rpc_hdr.tid = ntohs(fp.message_id);
+                rpc_hdr.dest = 0; // Not used for UNIDATA
+                rpc_hdr.from = 0; // Not used for UNIDATA
+
+                std::vector<uint8_t> pkt_buf(sizeof(flip_packet) + fp.length);
                 std::memcpy(pkt_buf.data(), &fp, sizeof(flip_packet));
-                std::memcpy(pkt_buf.data() + sizeof(flip_packet), trans_data->data(), trans_data->size());
+                std::memcpy(pkt_buf.data() + sizeof(flip_packet), &rpc_hdr, sizeof(rpc_header));
+                std::memcpy(pkt_buf.data() + sizeof(flip_packet) + sizeof(rpc_header), hdr.get(), sizeof(am_header));
+                std::memcpy(pkt_buf.data() + sizeof(flip_packet) + sizeof(rpc_header) + sizeof(am_header), trans_data->data(), hdr->bufsize);
 
                 static const hwaddr_t local_mac{};
                 router->route_packet(local_mac, pkt_buf.data(), pkt_buf.size(), 0);
