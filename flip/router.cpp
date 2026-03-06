@@ -138,7 +138,16 @@ void flip_router::route_packet(hwaddr_t src_mac, const uint8_t* packet, size_t l
 
             // Route UNIDATA based on destination
             if (dst_route && dst_route->local) {
-                // Destination is local, deliver to application (don't forward)
+                // Destination is local — deliver RPC replies to the associated client
+                if (len >= sizeof(struct flip_packet) + sizeof(rpc_header) && fp->offset == 0) {
+                    const rpc_header* rpc_hdr2 = (const rpc_header*)(packet + sizeof(struct flip_packet));
+                    if (rpc_hdr2->type == AM_RPC_REPLY && on_local_rpc_reply) {
+                        const uint8_t* payload = packet + sizeof(struct flip_packet) + sizeof(rpc_header);
+                        size_t payload_len = len - sizeof(struct flip_packet) - sizeof(rpc_header);
+                        on_local_rpc_reply(fp->dst_address, payload, payload_len);
+                        send_rpc_ack(fp->dst_address, fp->src_address, rpc_hdr2);
+                    }
+                }
                 std::cout << "UNIDATA for local destination " << fp->dst_address << std::endl;
             } else if (dst_route && fp->actual_hopcount < fp->max_hopcount) {
                 // Destination is known, forward to specific network
@@ -315,6 +324,43 @@ void flip_router::handle_rpc_hereis(flip_address_t src_addr, const rpc_header* r
     rpc_port_t port_array;
     std::copy(rpc_hdr->port, rpc_hdr->port + 6, port_array.begin());
     rpc_port_mgr->resolve_remote_lookup(port_array, std::to_string(src_addr), true);
+}
+
+void flip_router::send_rpc_ack(flip_address_t src, flip_address_t dst, const rpc_header* original_rpc_hdr)
+{
+    auto dst_route = find_route(dst);
+    if (!dst_route) {
+        std::cerr << "send_rpc_ack: no route to " << dst << std::endl;
+        return;
+    }
+
+    struct flip_packet ack_fp{};
+    ack_fp.version = 1;
+    ack_fp.type = static_cast<uint8_t>(flip_type::UNIDATA);
+    ack_fp.flags = 0;
+    ack_fp.actual_hopcount = 0;
+    ack_fp.max_hopcount = 8;
+    ack_fp.dst_address = dst;
+    ack_fp.src_address = src;
+    ack_fp.message_id = ++locate_tid;
+    ack_fp.length = sizeof(rpc_header);
+    ack_fp.offset = 0;
+    ack_fp.total_length = sizeof(rpc_header);
+
+    rpc_header ack_rpc{};
+    ack_rpc.kid = original_rpc_hdr->kid;
+    std::copy(original_rpc_hdr->port, original_rpc_hdr->port + 6, ack_rpc.port);
+    ack_rpc.type = AM_RPC_ACK;
+    ack_rpc.flags = 0;
+    ack_rpc.tid = original_rpc_hdr->tid;
+    ack_rpc.dest = original_rpc_hdr->from;
+    ack_rpc.from = original_rpc_hdr->dest;
+
+    uint8_t buf[sizeof(flip_packet) + sizeof(rpc_header)];
+    std::memcpy(buf, &ack_fp, sizeof(ack_fp));
+    std::memcpy(buf + sizeof(ack_fp), &ack_rpc, sizeof(ack_rpc));
+
+    forward_unicast(buf, sizeof(buf), dst_route->next_hop_mac, dst_route->network);
 }
 
 void flip_router::forward_broadcast(const uint8_t* packet, size_t len, flip_network_t incoming_network)

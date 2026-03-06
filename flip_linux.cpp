@@ -110,6 +110,15 @@ int main(int argc, char* argv[])
     pfds.push_back(timer_pfd);
 
     router = std::make_unique<flip_router>(networks);
+    router->set_local_rpc_reply_cb([](flip_address_t dst, const uint8_t* payload, size_t len) {
+        for (const auto& [fd, addr] : unix_client_addresses) {
+            if (addr == dst) {
+                unix_server->send_to_client(fd, UNIX_MSG_TRANS, payload, len);
+                return;
+            }
+        }
+        std::cerr << "No unix client for local FLIP address " << dst << std::endl;
+    });
 
     // Start Unix socket server
     unix_server = std::make_unique<UnixServer>("/tmp/flip.sock");
@@ -149,12 +158,12 @@ int main(int argc, char* argv[])
                 fp.dst_address = dst_addr;
                 fp.src_address = src_addr;
                 fp.message_id = ++trans_tid;
-                fp.length = static_cast<uint32_t>(sizeof(rpc_header) + sizeof(am_header) + hdr->bufsize);
+                fp.length = static_cast<uint32_t>(sizeof(rpc_header) + sizeof(am_header) + trans_data->size());
                 fp.offset = 0;
                 fp.total_length = fp.length;
 
                 struct rpc_header rpc_hdr{};
-                rpc_hdr.kid = 0; // Not used for UNIDATA
+                rpc_hdr.kid = (uint64_t)hdr.get();
                 std::copy(hdr->port, hdr->port + 6, rpc_hdr.port);
                 rpc_hdr.type = AM_RPC_REQUEST;
                 rpc_hdr.flags = 0;
@@ -166,7 +175,9 @@ int main(int argc, char* argv[])
                 std::memcpy(pkt_buf.data(), &fp, sizeof(flip_packet));
                 std::memcpy(pkt_buf.data() + sizeof(flip_packet), &rpc_hdr, sizeof(rpc_header));
                 std::memcpy(pkt_buf.data() + sizeof(flip_packet) + sizeof(rpc_header), hdr.get(), sizeof(am_header));
-                std::memcpy(pkt_buf.data() + sizeof(flip_packet) + sizeof(rpc_header) + sizeof(am_header), trans_data->data(), hdr->bufsize);
+                if (!trans_data->empty()) {
+                    std::memcpy(pkt_buf.data() + sizeof(flip_packet) + sizeof(rpc_header) + sizeof(am_header), trans_data->data(), trans_data->size());
+                }
 
                 static const hwaddr_t local_mac{};
                 router->route_packet(local_mac, pkt_buf.data(), pkt_buf.size(), 0);
@@ -193,9 +204,6 @@ int main(int argc, char* argv[])
             if (need_locate) {
                 router->send_rpc_locate(src_addr, port_array);
             }
-        } else {
-            std::cout << "Unix message from fd=" << client_fd << " type=" << type << " len=" << len << std::endl;
-            (void)payload;
         }
     });
     unix_server->set_on_connect([](int client_fd) {
