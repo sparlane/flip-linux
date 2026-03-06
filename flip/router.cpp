@@ -1,6 +1,60 @@
 #include <iostream>
 #include <cstring>
+#include <algorithm>
 #include "flip_router.hpp"
+
+// Standard Ethernet payload limit (excluding Ethernet header)
+constexpr size_t MAX_ETH_PAYLOAD = 1500;
+// Max FLIP data bytes per Ethernet frame after fc_header (2B) and flip_packet (40B)
+constexpr size_t MAX_FLIP_FRAGMENT_DATA = MAX_ETH_PAYLOAD - sizeof(fc_header) - sizeof(flip_packet);
+
+// Send a FLIP packet (without fc_header), fragmenting across multiple Ethernet frames if needed.
+static bool fragment_and_send(std::shared_ptr<NetDrv> driver, const hwaddr_t& dst, uint16_t ethertype,
+                               const uint8_t* packet, size_t len)
+{
+    if (len < sizeof(flip_packet)) return false;
+
+    const flip_packet* orig_fp = reinterpret_cast<const flip_packet*>(packet);
+    const uint8_t* payload = packet + sizeof(flip_packet);
+    size_t payload_len = len - sizeof(flip_packet);
+
+    if (sizeof(fc_header) + len <= MAX_ETH_PAYLOAD) {
+        uint8_t buf[MAX_ETH_PAYLOAD];
+        fc_header fch{0, 0};
+        std::memcpy(buf, &fch, sizeof(fch));
+        std::memcpy(buf + sizeof(fch), packet, len);
+        return driver->send(dst, ethertype, buf, sizeof(fch) + len);
+    }
+
+    // Packet exceeds Ethernet MTU — fragment the payload
+    uint32_t total_length = orig_fp->total_length ? orig_fp->total_length
+                                                   : static_cast<uint32_t>(payload_len);
+    uint32_t base_offset = orig_fp->offset;
+    size_t offset = 0;
+    bool ok = true;
+
+    while (offset < payload_len) {
+        size_t chunk = std::min(payload_len - offset, MAX_FLIP_FRAGMENT_DATA);
+
+        flip_packet frag_fp = *orig_fp;
+        frag_fp.offset      = base_offset + static_cast<uint32_t>(offset);
+        frag_fp.length      = static_cast<uint32_t>(chunk);
+        frag_fp.total_length = total_length;
+
+        fc_header fch{0, 0};
+        uint8_t buf[MAX_ETH_PAYLOAD];
+        size_t buf_len = sizeof(fch) + sizeof(frag_fp) + chunk;
+        std::memcpy(buf, &fch, sizeof(fch));
+        std::memcpy(buf + sizeof(fch), &frag_fp, sizeof(frag_fp));
+        std::memcpy(buf + sizeof(fch) + sizeof(frag_fp), payload + offset, chunk);
+
+        if (!driver->send(dst, ethertype, buf, buf_len)) ok = false;
+        offset += chunk;
+
+        usleep (1000); // Small delay to avoid overwhelming the network with fragments
+    }
+    return ok;
+}
 
 flip_router::flip_router(std::shared_ptr<flip_networks> net)
 {
@@ -365,61 +419,54 @@ void flip_router::send_rpc_ack(flip_address_t src, flip_address_t dst, const rpc
 
 void flip_router::forward_broadcast(const uint8_t* packet, size_t len, flip_network_t incoming_network)
 {
-    if (!networks) {
+    if (!networks || len < sizeof(flip_packet)) return;
+
+    uint8_t *fwd = new uint8_t[len + 1];
+    if (fwd == nullptr) {
+        std::cerr << "Packet allocation failed (" << len << " bytes)" << std::endl;
         return;
     }
+    std::memcpy(fwd, packet, len);
+    flip_packet* fwd_fp = reinterpret_cast<flip_packet*>(fwd);
+    fwd_fp->actual_hopcount += 3;
+    std::string pkt_type = packet_type_to_string((flip_type)fwd_fp->type);
 
-    uint8_t forward_buf[2048];
-    if (sizeof(fc_header) + len > sizeof(forward_buf)) {
-        std::cerr << "Packet too large to forward" << std::endl;
-        return;
-    }
-
-    struct fc_header fch{};
-    std::memcpy(forward_buf, &fch, sizeof(fch));
-    std::memcpy(forward_buf + sizeof(fch), packet, len);
-    struct flip_packet* forward_pkt = (struct flip_packet*)(forward_buf + sizeof(fch));
-    forward_pkt->actual_hopcount+=3;
-    size_t forward_len = sizeof(fch) + len;
-
+    const hwaddr_t broadcast{0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     const auto& nets = networks->get_networks();
     for (const auto& [net_id, driver] : nets) {
         if (net_id != incoming_network) {
-            if (!driver->send(std::array<uint8_t, 6>{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, FLIP_ETHERTYPE, forward_buf, forward_len)) {
-                std::cerr << "Failed to forward " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << net_id << std::endl;
+            if (!fragment_and_send(driver, broadcast, FLIP_ETHERTYPE, fwd, len)) {
+                std::cerr << "Failed to forward " << pkt_type << " to network " << net_id << std::endl;
             } else {
-                std::cout << "Forwarded " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << net_id << std::endl;
+                std::cout << "Forwarded " << pkt_type << " to network " << net_id << std::endl;
             }
         }
     }
+    delete[] fwd;
 }
 
 void flip_router::forward_unicast(const uint8_t* packet, size_t len, const hwaddr_t dst_mac, flip_network_t dst_network)
 {
-    if (!networks) {
+    if (!networks || len < sizeof(flip_packet)) return;
+
+    uint8_t *fwd = new uint8_t[len + 1];
+    if (fwd == nullptr) {
+        std::cerr << "Packet allocation failed (" << len << " bytes)" << std::endl;
         return;
     }
-
-    uint8_t forward_buf[2048];
-    if (sizeof(fc_header) + len > sizeof(forward_buf)) {
-        std::cerr << "Packet too large to forward" << std::endl;
-        return;
-    }
-
-    struct fc_header fch{};
-    std::memcpy(forward_buf, &fch, sizeof(fch));
-    std::memcpy(forward_buf + sizeof(fch), packet, len);
-    struct flip_packet* forward_pkt = (struct flip_packet*)(forward_buf + sizeof(fch));
-    forward_pkt->actual_hopcount+=3;
-    size_t forward_len = sizeof(fch) + len;
+    std::memcpy(fwd, packet, len);
+    flip_packet* fwd_fp = reinterpret_cast<flip_packet*>(fwd);
+    fwd_fp->actual_hopcount += 3;
+    std::string pkt_type = packet_type_to_string((flip_type)fwd_fp->type);
 
     const auto& nets = networks->get_networks();
     auto it = nets.find(dst_network);
     if (it != nets.end()) {
-        if (!it->second->send(dst_mac, FLIP_ETHERTYPE, forward_buf, forward_len)) {
-            std::cerr << "Failed to forward " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << dst_network << std::endl;
+        if (!fragment_and_send(it->second, dst_mac, FLIP_ETHERTYPE, fwd, len)) {
+            std::cerr << "Failed to forward " << pkt_type << " to network " << dst_network << std::endl;
         } else {
-            std::cout << "Forwarded " << packet_type_to_string((flip_type)forward_pkt->type) << " to network " << dst_network << std::endl;
+            std::cout << "Forwarded " << pkt_type << " to network " << dst_network << std::endl;
         }
     }
+    delete[] fwd;
 }
