@@ -68,7 +68,19 @@ void recv_packet(const uint8_t* packet, size_t len, flip_network_t incoming_netw
     {
         router->route_packet(std::to_array(eth->h_source), packet + sizeof(struct ethhdr) + sizeof(struct fc_header), len - sizeof(struct ethhdr) - sizeof(struct fc_header), incoming_network);
     }
+    else if (fc->fc_type == 1)
+    {
+        constexpr size_t MIN_PAYLOAD = 60 - sizeof(struct ethhdr);
+        uint8_t response[MIN_PAYLOAD] = {};
+        struct fc_header *resp_fc = reinterpret_cast<struct fc_header *>(response);
+        resp_fc->fc_type = 2;
+        resp_fc->fc_cnt = 5;
+        auto net = networks->get_networks().at(incoming_network);
+        net->send(std::to_array(eth->h_source), FLIP_ETHERTYPE, response, sizeof(response));
+    }
 }
+
+uint64_t kid_alloc = 1;
 
 int main(int argc, char* argv[])
 {
@@ -163,7 +175,7 @@ int main(int argc, char* argv[])
                 fp.total_length = fp.length;
 
                 struct rpc_header rpc_hdr{};
-                rpc_hdr.kid = (uint64_t)hdr.get();
+                rpc_hdr.kid = kid_alloc++;
                 std::copy(hdr->port, hdr->port + 6, rpc_hdr.port);
                 rpc_hdr.type = AM_RPC_REQUEST;
                 rpc_hdr.flags = 0;
