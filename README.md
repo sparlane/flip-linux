@@ -80,6 +80,11 @@ sudo ./flip_linux tap0 tap1
 
 The daemon will listen on all specified TAP interfaces, route incoming FLIP packets, maintain a routing table, and age out stale routes every 30 seconds.
 
+## Amoeba src integration
+
+If you have the amoeba source code, replace src/unix/lib/amoeba.c with the one from this repo.
+If you are on a 64-bit machine, you will also need to fix the definition of "int32" and "uint32" to be "int" and "unsigned int" respectively, rather than "long" and "unsigned long".
+
 ## How It Works
 
 1. **Startup** — Opens each TAP device specified on the command line and registers it as a FLIP network interface.
@@ -101,9 +106,9 @@ This project is a work in progress. Currently implemented:
 - [x] Basic routing table with source-route learning
 - [x] LOCATE / HEREIS / NOTHERE handling (partial)
 - [x] Route aging timer
-- [ ] UNIDATA forwarding and local delivery
-- [ ] MULTIDATA support
-- [ ] RPC layer for Amoeba service communication
+- [x] UNIDATA forwarding and local delivery
+- [x] MULTIDATA support
+- [x] RPC layer for Amoeba service communication
 - [ ] HEREIS response generation
 - [ ] Full route aging and pruning logic
 - [ ] Trusted / untrusted network handling
