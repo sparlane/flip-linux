@@ -20,6 +20,30 @@ std::shared_ptr<flip_networks> networks;
 std::unique_ptr<UnixServer> unix_server;
 std::unordered_map<int, flip_address_t> unix_client_addresses;
 
+struct ReassemblyKey {
+    flip_address_t src_address;
+    uint32_t message_id;
+    bool operator==(const ReassemblyKey& o) const {
+        return src_address == o.src_address && message_id == o.message_id;
+    }
+};
+
+struct ReassemblyKeyHash {
+    size_t operator()(const ReassemblyKey& k) const {
+        return std::hash<uint64_t>()(k.src_address) ^ (std::hash<uint32_t>()(k.message_id) * 2654435761ULL);
+    }
+};
+
+struct ReassemblyEntry {
+    hwaddr_t src_mac;
+    flip_network_t incoming_network;
+    flip_packet header;
+    std::vector<uint8_t> payload;
+    uint32_t bytes_received;
+};
+
+static std::unordered_map<ReassemblyKey, ReassemblyEntry, ReassemblyKeyHash> reassembly_map;
+
 static flip_address_t allocate_unix_client_address()
 {
     static std::mt19937_64 rng(std::random_device{}());
@@ -66,7 +90,72 @@ void recv_packet(const uint8_t* packet, size_t len, flip_network_t incoming_netw
     struct fc_header *fc = (struct fc_header *)(packet + sizeof(struct ethhdr));
     if (fc->fc_type == 0)
     {
-        router->route_packet(std::to_array(eth->h_source), packet + sizeof(struct ethhdr) + sizeof(struct fc_header), len - sizeof(struct ethhdr) - sizeof(struct fc_header), incoming_network);
+        const uint8_t* flip_data = packet + sizeof(struct ethhdr) + sizeof(struct fc_header);
+        size_t flip_len = len - sizeof(struct ethhdr) - sizeof(struct fc_header);
+
+        if (flip_len < sizeof(struct flip_packet)) {
+            std::cerr << "Fragment too short for FLIP header" << std::endl;
+            return;
+        }
+
+        const struct flip_packet* fp = (const struct flip_packet*)flip_data;
+        uint32_t frag_offset = fp->offset;
+        uint32_t frag_length = fp->length;
+        uint32_t total_length = fp->total_length;
+
+        // Not fragmented: deliver directly
+        if (frag_offset == 0 && (total_length == 0 || frag_length == total_length)) {
+            router->route_packet(std::to_array(eth->h_source), flip_data, flip_len, incoming_network);
+            return;
+        }
+
+        // Fragmented: reassemble
+        ReassemblyKey key{fp->src_address, fp->message_id};
+
+        if (frag_offset == 0) {
+            // First fragment: initialise entry
+            ReassemblyEntry& entry = reassembly_map[key];
+            entry.src_mac = std::to_array(eth->h_source);
+            entry.incoming_network = incoming_network;
+            entry.header = *fp;
+            entry.payload.assign(total_length, 0);
+            entry.bytes_received = 0;
+        }
+
+        auto it = reassembly_map.find(key);
+        if (it == reassembly_map.end()) {
+            std::cerr << "Out-of-order fragment (no first fragment yet), discarding" << std::endl;
+            return;
+        }
+
+        ReassemblyEntry& entry = it->second;
+        const uint8_t* frag_payload = flip_data + sizeof(struct flip_packet);
+        size_t frag_payload_len = flip_len - sizeof(struct flip_packet);
+
+        if (frag_offset + frag_length > total_length || frag_length > frag_payload_len) {
+            std::cerr << "Invalid fragment bounds, discarding reassembly" << std::endl;
+            reassembly_map.erase(it);
+            return;
+        }
+
+        std::memcpy(entry.payload.data() + frag_offset, frag_payload, frag_length);
+        entry.bytes_received += frag_length;
+
+        if (entry.bytes_received >= total_length) {
+            // Reassembly complete: reconstruct full packet and deliver
+            entry.header.offset = 0;
+            entry.header.length = total_length;
+            entry.header.total_length = total_length;
+
+            std::vector<uint8_t> full_packet(sizeof(flip_packet) + total_length);
+            std::memcpy(full_packet.data(), &entry.header, sizeof(flip_packet));
+            std::memcpy(full_packet.data() + sizeof(flip_packet), entry.payload.data(), total_length);
+
+            hwaddr_t src_mac = entry.src_mac;
+            flip_network_t net = entry.incoming_network;
+            reassembly_map.erase(it);
+            router->route_packet(src_mac, full_packet.data(), full_packet.size(), net);
+        }
     }
     else if (fc->fc_type == 1)
     {
