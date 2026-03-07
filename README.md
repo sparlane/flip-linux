@@ -12,9 +12,9 @@ This allows programs on a Linux host to participate in an Amoeba FLIP network �
 
 ```
 ┌─────────────────────────────────┐
-│         flip_linux (main)       │  Event loop (poll-based)
+│         flip_linux (main)       │  Event loop (poll-based), Unix socket server
 ├──────────┬──────────────────────┤
-│  Router  │  Protocol (RPC/AIDL) │  FLIP routing table & packet handling
+│  Router  │   RPC Port Manager   │  FLIP routing table & RPC dispatch
 ├──────────┴──────────────────────┤
 │        Network Driver (TAP)     │  TAP interface abstraction
 └─────────────────────────────────┘
@@ -22,15 +22,19 @@ This allows programs on a Linux host to participate in an Amoeba FLIP network �
 
 | Component | Description |
 |---|---|
-| **flip_linux.cpp** | Main entry point. Opens one or more TAP devices, runs the `poll()` event loop, dispatches incoming Ethernet frames, and fires a 30-second timer for routing table maintenance. |
-| **flip/router.cpp** | FLIP routing table and packet routing logic. Learns routes from incoming packets, handles LOCATE/HEREIS/UNIDATA/NOTHERE/UNTRUSTED message types, and ages stale routes. |
-| **flip/protocol.cpp** | Higher-level FLIP protocol handling (RPC layer — work in progress). |
+| **flip_linux.cpp** | Main entry point. Opens one or more TAP devices, runs the `poll()` event loop, performs fragment reassembly, dispatches incoming Ethernet frames, manages Unix socket clients, and fires a 30-second timer for routing table maintenance. |
+| **flip/router.cpp** | FLIP routing table and packet routing logic. Learns routes from incoming packets, handles LOCATE/HEREIS/UNIDATA/MULTIDATA/NOTHERE/UNTRUSTED message types, and handles RPC LOCATE/HEREIS/ACK. |
+| **flip/protocol.cpp** | Supplementary protocol utilities (work in progress). |
+| **rpc/port_manager.cpp** | RPC port registry. Tracks locally registered ports and pending remote lookups; resolves port-to-FLIP-address mappings. |
+| **unix/unix_server.cpp** | Unix domain socket server (`/tmp/flip.sock`). Accepts connections from local Amoeba clients, frames messages, and delivers RPC replies. |
 | **driver/tap.cpp** | Linux TAP network driver. Opens `/dev/net/tun` in TAP mode (layer 2, no PI header), reads/writes raw Ethernet frames. |
-| **include/flip_proto.hpp** | FLIP protocol definitions — packet header, message types (LOCATE, HEREIS, UNIDATA, MULTIDATA, NOTHERE, UNTRUSTED), flags, and the fragment control header. |
+| **include/flip_proto.hpp** | FLIP protocol definitions — packet header, message types (LOCATE, HEREIS, UNIDATA, MULTIDATA, NOTHERE, UNTRUSTED), flags, fragment control header, and RPC header. |
 | **include/flip_router.hpp** | Routing table entry and router class declarations. |
 | **include/netdrv.hpp** | Abstract `NetDrv` base class for network drivers, plus the `flip_networks` registry that assigns network IDs. |
+| **include/rpc_port_manager.hpp** | RPC port manager class declaration. |
+| **include/unix_server.hpp** | Unix socket server class declaration. |
 | **include/tap.hpp** | TAP driver class declaration. |
-| **rpc/** | Placeholder for Amoeba RPC protocol implementation. |
+| **amoeba.c** | Drop-in replacement for `src/unix/lib/amoeba.c` in the Amoeba source tree. |
 
 ## FLIP Packet Types
 
@@ -78,7 +82,7 @@ Multiple TAP interfaces can be specified to bridge FLIP traffic across networks:
 sudo ./flip_linux tap0 tap1
 ```
 
-The daemon will listen on all specified TAP interfaces, route incoming FLIP packets, maintain a routing table, and age out stale routes every 30 seconds.
+The daemon will listen on all specified TAP interfaces, route incoming FLIP packets, maintain a routing table, and age out stale routes every 30 seconds. Local Amoeba clients connect via the Unix socket at `/tmp/flip.sock`.
 
 ## Amoeba src integration
 
@@ -87,15 +91,17 @@ If you are on a 64-bit machine, you will also need to fix the definition of "int
 
 ## How It Works
 
-1. **Startup** — Opens each TAP device specified on the command line and registers it as a FLIP network interface.
-2. **Event loop** — Uses `poll()` to wait for incoming packets on any TAP interface or a periodic 30-second timer.
-3. **Packet reception** — Incoming Ethernet frames are filtered by the FLIP Ethertype (`0x8146`). Valid FLIP packets are passed to the router after stripping the Ethernet and fragment control headers.
+1. **Startup** — Opens each TAP device specified on the command line, registers it as a FLIP network interface, and starts the Unix socket server at `/tmp/flip.sock`.
+2. **Event loop** — Uses `poll()` to wait for incoming packets on any TAP interface, messages from local Unix clients, or a periodic 30-second timer.
+3. **Packet reception** — Incoming Ethernet frames are filtered by the FLIP Ethertype (`0x8146`). The fragment control header is stripped; fragmented messages are reassembled before being passed to the router.
 4. **Routing** — The router learns source routes from incoming packets and makes forwarding decisions based on the FLIP message type:
-   - **LOCATE** — If the destination is local, responds with HEREIS; otherwise forwards.
-   - **HEREIS** — Updates the routing table.
-   - **UNIDATA** — Delivers locally or forwards to the next hop.
+   - **LOCATE** — If the destination is local, responds with HEREIS; otherwise broadcasts to all other networks.
+   - **HEREIS** — Updates the routing table; forwards to destination if known.
+   - **UNIDATA** — Delivers locally (including RPC replies to Unix clients) or forwards to the next hop.
+   - **MULTIDATA** — Handles RPC LOCATE requests for locally registered ports; broadcasts to all other networks.
    - **NOTHERE** — Removes the route for the unreachable destination.
-5. **Route aging** — Every 30 seconds, routing entries are aged and stale routes are pruned.
+5. **Local clients** — Programs connect via the Unix socket, are assigned a random FLIP address, and can send RPC requests to Amoeba services. The daemon resolves ports via FLIP RPC LOCATE/HEREIS and routes replies back.
+6. **Route aging** — Every 30 seconds, `increment_age()` is called for routing table maintenance (full aging logic is not yet implemented).
 
 ## Status
 
